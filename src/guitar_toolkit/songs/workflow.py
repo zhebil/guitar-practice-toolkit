@@ -93,9 +93,13 @@ class SongWorkflow:
         return bpm_info
 
     def step_tabs(self) -> Path | None:
-        """Search and download tabs from Songsterr as a GP7/8 file."""
+        """Download tabs from Songsterr, sync with YouTube audio, output single GP file."""
         from guitar_toolkit.tabs.download import search_songsterr
-        from guitar_toolkit.tabs.gen_gp import fetch_all_tracks, generate_gp
+        from guitar_toolkit.tabs.gen_gp import fetch_all_tracks, generate_gp, fetch_song_meta
+        from guitar_toolkit.tabs.sync import (
+            fetch_video_points, select_video_entry, sync_gp_file,
+            download_youtube_audio, print_summary,
+        )
 
         query = f"{self.artist} {self.song_name}" if self.artist else self.song_name
         log(f"Searching tabs: {query}")
@@ -104,119 +108,71 @@ class SongWorkflow:
             results = search_songsterr(query)
             if not results:
                 log("No tabs found")
-                self.results["tabs"] = None
                 return None
 
             best = results[0]
+            song_id = best["id"]
             log(f"Found: {best['artist']} - {best['title']} ({len(best['tracks'])} tracks)")
 
-            meta, tracks = fetch_all_tracks(best["id"])
+            # Generate GP file from Songsterr track data
+            meta, tracks = fetch_all_tracks(song_id)
             self.results["tab_meta"] = meta
 
             filename = f"{best['artist']} - {best['title']}".replace("/", "-")
             output_dir = Path("tabs")
             output_dir.mkdir(parents=True, exist_ok=True)
-            output_path = output_dir / f"{filename}.gp"
-            generate_gp(tracks, output_path, meta)
+            raw_gp = output_dir / f".tmp_{filename}.gp"
+            generate_gp(tracks, raw_gp, meta)
 
-            self.results["tabs"] = output_path
-            self.results["songsterr_id"] = best["id"]
-            log(f"Tabs: {output_path}")
-            return output_path
-        except Exception as e:
-            log(f"Tabs error: {e}")
-            self.results["tabs"] = None
-            return None
+            # Sync with YouTube audio
+            revision_id = meta["revisionId"]
+            log("Fetching video sync points...")
+            entries = fetch_video_points(song_id, revision_id)
 
-    def step_gp_info(self) -> dict | None:
-        """Extract GP metadata from Songsterr API or PyGuitarPro."""
-        tabs_path = self.results.get("tabs")
-        if not tabs_path or not Path(tabs_path).exists():
-            return None
+            final_path = output_dir / f"{filename}.gp"
 
-        suffix = Path(tabs_path).suffix.lower()
+            if entries:
+                entry = select_video_entry(entries)
+                points = entry["points"]
+                video_id = entry["videoId"]
 
-        if suffix in (".gp3", ".gp4", ".gp5"):
-            try:
-                from guitar_toolkit.tabs.gp_parser import parse_gp_file
-                info = parse_gp_file(tabs_path)
-                self.results["gp_info"] = info
-                return info
-            except Exception as e:
-                log(f"Could not parse GP file: {e}")
-                return None
+                audio_path = output_dir / ".tmp_sync_audio.mp3"
+                trim_start = points[0] if points else 0.0
+                log("Downloading YouTube audio for sync...")
+                download_youtube_audio(video_id, audio_path, trim_start=trim_start)
 
-        tab_meta = self.results.get("tab_meta")
-        if tab_meta:
-            tracks = []
-            for t in tab_meta.get("tracks", []):
-                tracks.append({
+                bpms = sync_gp_file(raw_gp, points, final_path, mp3_path=audio_path)
+
+                audio_path.unlink(missing_ok=True)
+                raw_gp.unlink(missing_ok=True)
+
+                log(f"Tabs (synced): {final_path}")
+                print_summary(bpms, points)
+            else:
+                log("No video sync points — saving tabs without audio")
+                raw_gp.rename(final_path)
+
+            # Extract track info from meta
+            gp_tracks = []
+            for t in meta.get("tracks", []):
+                gp_tracks.append({
                     "name": t.get("name", ""),
                     "instrument": t.get("instrument", ""),
                     "tuning": t.get("tuning", []),
                 })
-            info = {
-                "title": tab_meta.get("title", ""),
-                "artist": tab_meta.get("artist", ""),
-                "tracks": tracks,
-                "measure_count": 0,
+            self.results["gp_info"] = {
+                "title": meta.get("title", ""),
+                "artist": meta.get("artist", ""),
+                "tracks": gp_tracks,
             }
-            self.results["gp_info"] = info
-            return info
 
-        return None
-
-    def step_sync(self) -> Path | None:
-        """Sync GP tabs with YouTube audio using Songsterr video points."""
-        from guitar_toolkit.tabs.sync import (
-            fetch_video_points, select_video_entry, sync_gp_file,
-            download_youtube_audio, print_summary,
-        )
-        from guitar_toolkit.tabs.gen_gp import fetch_song_meta
-
-        tabs_path = self.results.get("tabs")
-        song_id = self.results.get("songsterr_id")
-        if not tabs_path or not song_id:
-            return None
-
-        tabs_path = Path(tabs_path)
-        if not tabs_path.exists():
-            return None
-
-        try:
-            meta = fetch_song_meta(song_id)
-            revision_id = meta["revisionId"]
-
-            log("Fetching video sync points...")
-            entries = fetch_video_points(song_id, revision_id)
-            if not entries:
-                log("No video sync points available")
-                return None
-
-            entry = select_video_entry(entries)
-            points = entry["points"]
-            video_id = entry["videoId"]
-
-            # Download YouTube audio trimmed to measure 1
-            audio_path = tabs_path.parent / ".tmp_sync_audio.mp3"
-            trim_start = points[0] if points else 0.0
-            log("Downloading YouTube audio for sync...")
-            download_youtube_audio(video_id, audio_path, trim_start=trim_start)
-
-            # Create synced GP file
-            synced_path = tabs_path.with_name(tabs_path.stem + "_synced.gp")
-            bpms = sync_gp_file(tabs_path, points, synced_path, mp3_path=audio_path)
-
-            # Clean up temp audio
-            if audio_path.exists():
-                audio_path.unlink()
-
-            self.results["synced_tabs"] = synced_path
-            log(f"Synced tabs: {synced_path}")
-            print_summary(bpms, points)
-            return synced_path
+            self.results["tabs"] = final_path
+            return final_path
         except Exception as e:
-            log(f"Sync error: {e}")
+            log(f"Tabs error: {e}")
+            # Clean up temp files
+            for tmp in Path("tabs").glob(".tmp_*"):
+                tmp.unlink(missing_ok=True)
             return None
 
     def run(self) -> dict:
@@ -225,8 +181,6 @@ class SongWorkflow:
         self.step_separate()
         self.step_bpm()
         self.step_tabs()
-        self.step_gp_info()
-        self.step_sync()
         return self.results
 
     def summary(self) -> str:
@@ -248,9 +202,7 @@ class SongWorkflow:
             bpm = self.results["bpm"]
             status = "stable" if bpm.get("stable") else f"{len(bpm.get('segments', []))} segments"
             lines.append(f"BPM:     {bpm['tempo']:.0f} ({status})")
-        if self.results.get("synced_tabs"):
-            lines.append(f"Tabs:    {self.results['synced_tabs']} (synced with audio)")
-        elif self.results.get("tabs"):
+        if self.results.get("tabs"):
             lines.append(f"Tabs:    {self.results['tabs']}")
         if self.results.get("gp_info"):
             info = self.results["gp_info"]

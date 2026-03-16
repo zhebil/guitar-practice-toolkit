@@ -917,12 +917,14 @@ class GPIFBuilder:
     def _beat_signature(self, obj: dict) -> tuple:
         """Compute a hashable signature for a beat object."""
         canonical_notes = tuple(self._note_id_map.get(n, n) for n in obj["note_ids"])
-        lyrics_sig = tuple(obj["lyrics"]) if "lyrics" in obj else None
+        lyrics_sig = tuple(str(x) for x in obj["lyrics"]) if "lyrics" in obj else None
+        whammy = tuple(obj["whammy"]) if obj.get("whammy") else None
+        tremolo = tuple(obj["tremolo"]) if isinstance(obj.get("tremolo"), list) else obj.get("tremolo")
         return (
             obj["rhythm_id"], obj["dynamic"], canonical_notes,
             obj.get("hairpin"), obj.get("free_text"),
-            obj.get("whammy"), lyrics_sig, obj.get("grace"),
-            obj.get("chord_id"), obj.get("tremolo"), obj.get("vibrato"),
+            whammy, lyrics_sig, obj.get("grace"),
+            obj.get("chord_id"), tremolo, obj.get("vibrato"),
             obj.get("brush"), obj.get("pick_stroke"),
         )
 
@@ -979,10 +981,12 @@ class GPIFBuilder:
                 f'destinationOffset="{d_off:.6f}"/>')
 
         if "tremolo" in obj:
-            # Tremolo picking: value is note subdivision (8, 16, 32)
+            # Tremolo picking: Songsterr sends [count, subdivision] or just a number
             trem = obj["tremolo"]
+            if isinstance(trem, list):
+                trem = trem[-1]  # last element is the subdivision (8, 16, 32)
             dur_map = {8: "Eighth", 16: "16th", 32: "32nd"}
-            trem_val = dur_map.get(trem, "16th")
+            trem_val = dur_map.get(trem, "32nd")
             lines.append(f'  <Tremolo><Duration>{trem_val}</Duration></Tremolo>')
 
         if "vibrato" in obj:
